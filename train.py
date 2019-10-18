@@ -11,6 +11,7 @@
 '''
 import os
 import warnings
+import time
 import mxnet as mx
 from mxnet import autograd
 from mxnet.gluon import nn
@@ -18,9 +19,17 @@ from mxnet.gluon import HybridBlock
 from gluoncv.nn.feature import FeatureExpander
 from gluoncv.nn.predictor import ConvPredictor
 from gluoncv.nn.coder import MultiPerClassDecoder, NormalizedBoxCenterDecoder
+from mxnet import nd
+
+from gluoncv.data.batchify import Tuple, Stack, Pad
+from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
+from mxnet.gluon.loss import Loss, _apply_weighting, _reshape_like
 
 import numpy as np
 from mxnet import gluon
+import gluoncv as gcv
+from gluoncv.loss import _as_list
+
 
 class SSDAnchorGenerator(gluon.HybridBlock):
     """Bounding box anchor generator for Single-shot Object Detection.
@@ -91,7 +100,7 @@ class SSDAnchorGenerator(gluon.HybridBlock):
             a = F.concat(*[cx.clip(0, W), cy.clip(0, H), cw.clip(0, W), ch.clip(0, H)], dim=-1)
         return a.reshape((1, -1, 4))
 
-class SSD(HybridBlock):
+class SSD_ORIENTAL(HybridBlock):
     """Single-shot Object Detection Network: https://arxiv.org/abs/1512.02325.
 
     Parameters
@@ -162,12 +171,12 @@ class SSD(HybridBlock):
 
     """
     def __init__(self, network, base_size, features, num_filters, sizes, ratios,
-                 steps, classes, use_1x1_transition=True, use_bn=True,
+                 steps, classes, oriental=('u','d','l','r'), use_1x1_transition=True, use_bn=True,
                  reduce_ratio=1.0, min_depth=128, global_pool=False, pretrained=False,
                  stds=(0.1, 0.1, 0.2, 0.2), nms_thresh=0.45, nms_topk=400, post_nms=100,
                  anchor_alloc_size=128, ctx=mx.cpu(),
                  norm_layer=nn.BatchNorm, norm_kwargs=None, **kwargs):
-        super(SSD, self).__init__(**kwargs)
+        super(SSD_ORIENTAL, self).__init__(**kwargs)
         if norm_kwargs is None:
             norm_kwargs = {}
         if network is None:
@@ -185,6 +194,9 @@ class SSD(HybridBlock):
         assert num_layers > 0, "SSD require at least one layer, suggest multiple."
         self._num_layers = num_layers
         self.classes = classes
+
+        self.oriental = oriental
+
         self.nms_thresh = nms_thresh
         self.nms_topk = nms_topk
         self.post_nms = post_nms
@@ -212,6 +224,7 @@ class SSD(HybridBlock):
                         use_bn=use_bn, reduce_ratio=reduce_ratio, min_depth=min_depth,
                         global_pool=global_pool, pretrained=pretrained, ctx=ctx)
             self.class_predictors = nn.HybridSequential()
+            self.ori_predictors = nn.HybridSequential()
             self.box_predictors = nn.HybridSequential()
             self.anchor_generators = nn.HybridSequential()
             asz = anchor_alloc_size
@@ -222,9 +235,14 @@ class SSD(HybridBlock):
                 asz = max(asz // 2, 16)  # pre-compute larger than 16x16 anchor map
                 num_anchors = anchor_generator.num_depth
                 self.class_predictors.add(ConvPredictor(num_anchors * (len(self.classes) + 1)))
+
+                self.ori_predictors.add(ConvPredictor(num_anchors * (len(self.oriental) + 1)))
+
                 self.box_predictors.add(ConvPredictor(num_anchors * 4))
             self.bbox_decoder = NormalizedBoxCenterDecoder(stds)
             self.cls_decoder = MultiPerClassDecoder(len(self.classes) + 1, thresh=0.01)
+
+            self.ori_decoder = MultiPerClassDecoder(len(self.oriental) + 1, thresh=0.01)
 
     @property
     def num_classes(self):
@@ -237,6 +255,18 @@ class SSD(HybridBlock):
 
         """
         return len(self.classes)
+
+    @property
+    def num_oriental(self):
+        """Return number of ori classes.
+
+        Returns
+        -------
+        int
+            Number of ORIENTAL classes
+
+        """
+        return len(self.oriental)
 
     def set_nms(self, nms_thresh=0.45, nms_topk=400, post_nms=100):
         """Set non-maximum suppression parameters.
@@ -269,17 +299,27 @@ class SSD(HybridBlock):
         features = self.features(x)
         cls_preds = [F.flatten(F.transpose(cp(feat), (0, 2, 3, 1)))
                      for feat, cp in zip(features, self.class_predictors)]
+
+        ori_preds = [F.flatten(F.transpose(cp(feat), (0, 2, 3, 1)))
+                     for feat, cp in zip(features, self.ori_predictors)]
+
         box_preds = [F.flatten(F.transpose(bp(feat), (0, 2, 3, 1)))
                      for feat, bp in zip(features, self.box_predictors)]
         anchors = [F.reshape(ag(feat), shape=(1, -1))
                    for feat, ag in zip(features, self.anchor_generators)]
         cls_preds = F.concat(*cls_preds, dim=1).reshape((0, -1, self.num_classes + 1))
+
+        ori_preds = F.concat(*ori_preds, dim=1).reshape((0, -1, self.num_oriental + 1))
+
         box_preds = F.concat(*box_preds, dim=1).reshape((0, -1, 4))
         anchors = F.concat(*anchors, dim=1).reshape((1, -1, 4))
         if autograd.is_training():
-            return [cls_preds, box_preds, anchors]
+            return [cls_preds, ori_preds, box_preds, anchors]
         bboxes = self.bbox_decoder(box_preds, anchors)
         cls_ids, scores = self.cls_decoder(F.softmax(cls_preds, axis=-1))
+
+        ori_ids, scores_ori = self.ori_decoder(F.softmax(ori_preds, axis=-1))
+
         results = []
         for i in range(self.num_classes):
             cls_id = cls_ids.slice_axis(axis=-1, begin=i, end=i+1)
@@ -288,6 +328,17 @@ class SSD(HybridBlock):
             per_result = F.concat(*[cls_id, score, bboxes], dim=-1)
             results.append(per_result)
         result = F.concat(*results, dim=1)
+
+        results_ori = []
+        for i in range(self.num_oriental):
+            ori_id = ori_ids.slice_axis(axis=-1, begin=i, end=i+1)
+            score_ori = scores_ori.slice_axis(axis=-1, begin=i, end=i + 1)
+            # per ori results
+            per_result = F.concat(*[ori_id, score_ori, bboxes], dim=-1)
+            results_ori.append(per_result)
+
+        result_ori = F.concat(*results_ori, dim=1)
+
         if self.nms_thresh > 0 and self.nms_thresh < 1:
             result = F.contrib.box_nms(
                 result, overlap_thresh=self.nms_thresh, topk=self.nms_topk, valid_thresh=0.01,
@@ -297,7 +348,7 @@ class SSD(HybridBlock):
         ids = F.slice_axis(result, axis=2, begin=0, end=1)
         scores = F.slice_axis(result, axis=2, begin=1, end=2)
         bboxes = F.slice_axis(result, axis=2, begin=2, end=6)
-        return ids, scores, bboxes
+        return ids, scores, bboxes,result_ori
 
     def reset_class(self, classes, reuse_weights=None):
         """Reset class categories and class predictors.
@@ -464,7 +515,7 @@ def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
     """
     pretrained_base = False if pretrained else pretrained_base
     base_name = None if callable(features) else name
-    net = SSD(base_name, base_size, features, filters, sizes, ratios, steps,
+    net = SSD_ORIENTAL(base_name, base_size, features, filters, sizes, ratios, steps,
               pretrained=pretrained_base, classes=classes, ctx=ctx, **kwargs)
     # if pretrained:
     #     from ..model_store import get_model_file
@@ -495,9 +546,8 @@ def ssd_512_mobilenet1_0_voc(pretrained=False, pretrained_base=True, **kwargs):
         A SSD detection network.
     """
     # classes = VOCDetection.CLASSES
-    classes = ('aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car',
-               'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike',
-               'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor')
+    classes = ('aeroplane',
+               'person', 'pottedplant',)
     return get_ssd('mobilenet1.0', 512,
                    features=['relu22_fwd', 'relu26_fwd'],
                    filters=[512, 512, 256, 256],
@@ -507,6 +557,190 @@ def ssd_512_mobilenet1_0_voc(pretrained=False, pretrained_base=True, **kwargs):
                    classes=classes, dataset='voc', pretrained=pretrained,
                    pretrained_base=pretrained_base, **kwargs)
 
+class SSDOrientalMultiBoxLoss(gluon.Block):
+    r"""Single-Shot Multibox Object Detection Loss.
+
+    .. note::
+
+        Since cross device synchronization is required to compute batch-wise statistics,
+        it is slightly sub-optimal compared with non-sync version. However, we find this
+        is better for converged model performance.
+
+    Parameters
+    ----------
+    negative_mining_ratio : float, default is 3
+        Ratio of negative vs. positive samples.
+    rho : float, default is 1.0
+        Threshold for trimmed mean estimator. This is the smooth parameter for the
+        L1-L2 transition.
+    lambd : float, default is 1.0
+        Relative weight between classification and box regression loss.
+        The overall loss is computed as :math:`L = loss_{class} + \lambda \times loss_{loc}`.
+    min_hard_negatives : int, default is 0
+        Minimum number of negatives samples.
+
+    """
+    def __init__(self, negative_mining_ratio=3, rho=1.0, lambd=1.0,
+                 min_hard_negatives=0, **kwargs):
+        super(SSDOrientalMultiBoxLoss, self).__init__(**kwargs)
+        self._negative_mining_ratio = max(0, negative_mining_ratio)
+        self._rho = rho
+        self._lambd = lambd
+        self._min_hard_negatives = max(0, min_hard_negatives)
+
+    def forward(self, cls_pred, ori_pred, box_pred, cls_target, ori_target, box_target):
+        """Compute loss in entire batch across devices."""
+        # require results across different devices at this time
+        cls_pred, ori_pred, box_pred, cls_target, box_target = [_as_list(x) \
+            for x in (cls_pred, ori_pred, box_pred, cls_target, box_target)]
+        # cross device reduction to obtain positive samples in entire batch
+        num_pos = []
+        for cp, op, bp, ct, bt in zip(*[cls_pred, ori_pred, box_pred, cls_target, box_target]):
+            pos_samples = (ct > 0)
+            num_pos.append(pos_samples.sum())
+        num_pos_all = sum([p.asscalar() for p in num_pos])
+        if num_pos_all < 1 and self._min_hard_negatives < 1:
+            # no positive samples and no hard negatives, return dummy losses
+            cls_losses = [nd.sum(cp * 0) for cp in cls_pred]
+            ori_losses = [nd.sum(op * 0) for op in ori_pred]
+            box_losses = [nd.sum(bp * 0) for bp in box_pred]
+            sum_losses = [nd.sum(cp * 0) + nd.sum(op * 0) + nd.sum(bp * 0) for cp, op, bp in zip(cls_pred, ori_pred, box_pred)]
+            return sum_losses, cls_losses, ori_losses, box_losses
+
+        # compute element-wise cross entropy loss and sort, then perform negative mining
+        cls_losses = []
+        ori_losses = []
+        box_losses = []
+        sum_losses = []
+        for cp, op, bp, ct, ot, bt in zip(*[cls_pred, ori_pred, box_pred, cls_target, ori_target, box_target]):
+            pred = nd.log_softmax(cp, axis=-1)
+            pos = ct > 0
+            cls_loss = -nd.pick(pred, ct, axis=-1, keepdims=False)
+            rank = (cls_loss * (pos - 1)).argsort(axis=1).argsort(axis=1)
+            hard_negative = rank < nd.maximum(self._min_hard_negatives, pos.sum(axis=1)
+                                              * self._negative_mining_ratio).expand_dims(-1)
+            # mask out if not positive or negative
+            cls_loss = nd.where((pos + hard_negative) > 0, cls_loss, nd.zeros_like(cls_loss))
+            cls_losses.append(nd.sum(cls_loss, axis=0, exclude=True) / max(1., num_pos_all))
+
+            pred = nd.log_softmax(op, axis=-1)
+            pos = ot > 0
+            ori_loss = -nd.pick(pred, ot, axis=-1, keepdims=False)
+            rank = (ori_loss * (pos - 1)).argsort(axis=1).argsort(axis=1)
+            hard_negative = rank < nd.maximum(self._min_hard_negatives, pos.sum(axis=1)
+                                              * self._negative_mining_ratio).expand_dims(-1)
+            # mask out if not positive or negative
+            ori_loss = nd.where((pos + hard_negative) > 0, ori_loss, nd.zeros_like(ori_loss))
+            ori_losses.append(nd.sum(ori_loss, axis=0, exclude=True) / max(1., num_pos_all))
+
+            bp = _reshape_like(nd, bp, bt)
+            box_loss = nd.abs(bp - bt)
+            box_loss = nd.where(box_loss > self._rho, box_loss - 0.5 * self._rho,
+                                (0.5 / self._rho) * nd.square(box_loss))
+            # box loss only apply to positive samples
+            box_loss = box_loss * pos.expand_dims(axis=-1)
+            box_losses.append(nd.sum(box_loss, axis=0, exclude=True) / max(1., num_pos_all))
+            sum_losses.append(cls_losses[-1] + self._lambd * box_losses[-1])
+            sum_losses.append(ori_losses[-1] + self._lambd * box_losses[-1])
+
+        return sum_losses, cls_losses, ori_losses, box_losses
+
+#############################################################################################
+# Finetuning is a new round of training
+# --------------------------------------
+# .. hint::
+#
+#     You will find a more detailed training implementation of SSD here:
+#     :download:`Download train_ssd.py<../../../scripts/detection/ssd/train_ssd.py>`
+def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
+
+    width, height = data_shape, data_shape
+    # use fake data to generate fixed anchors for target generation
+    with autograd.train_mode():
+        _, _, anchors = net(mx.nd.zeros((1, 3, height, width)))
+    batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
+    train_loader = gluon.data.DataLoader(
+        train_dataset.transform(SSDDefaultTrainTransform(width, height, anchors)),
+        batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
+    return train_loader
+
 if __name__ == '__main__':
     net = ssd_512_mobilenet1_0_voc()
     print(net)
+    # mx.viz.plot_network(net).view()
+    # net.render("net-test")
+    x = mx.sym.var('data')
+    asd = net(x)
+    # mx.viz.plot_network(asd[-1],node_attrs={"shape":"oval","fixedsize":"false"}).view()
+
+    #############################################################################################
+    # We can load dataset using ``RecordFileDetection``
+    dataset = gcv.data.RecordFileDetection('pikachu_train.rec')
+    classes = ['pikachu']  # only one foreground class here
+    image, label = dataset[0]
+
+    train_data = get_dataloader(net, dataset, 512, 16, 0)
+
+    #############################################################################################
+    # Try use GPU for training
+    try:
+        a = mx.nd.zeros((1,), ctx=mx.gpu(0))
+        ctx = [mx.gpu(0)]
+    except:
+        ctx = [mx.cpu()]
+
+    #############################################################################################
+    # Start training(finetuning)
+    net.collect_params().reset_ctx(ctx)
+    trainer = gluon.Trainer(
+        net.collect_params(), 'sgd',
+        {'learning_rate': 0.001, 'wd': 0.0005, 'momentum': 0.9})
+
+    mbox_loss = SSDOrientalMultiBoxLoss()
+    ce_metric = mx.metric.Loss('CrossEntropy')
+    ori_ce_metric = mx.metric.Loss('CrossEntropy')
+    smoothl1_metric = mx.metric.Loss('SmoothL1')
+
+    for epoch in range(0, 2):
+        ce_metric.reset()
+        ori_ce_metric.reset()
+        smoothl1_metric.reset()
+        tic = time.time()
+        btic = time.time()
+        net.hybridize(static_alloc=True, static_shape=True)
+        for i, batch in enumerate(train_data):
+            batch_size = batch[0].shape[0]
+            data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
+            cls_targets = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
+            box_targets = gluon.utils.split_and_load(batch[2], ctx_list=ctx, batch_axis=0)
+            with autograd.record():
+                cls_preds = []
+                ori_preds = []
+                box_preds = []
+                for x in data:
+                    cls_pred, ori_pred, box_pred, _ = net(x)
+                    cls_preds.append(cls_pred)
+                    ori_preds.append(ori_pred)
+                    box_preds.append(box_pred)
+                sum_loss, cls_loss, ori_loss, box_loss = mbox_loss(
+                    cls_preds,ori_preds , box_preds, cls_targets, box_targets)
+                autograd.backward(sum_loss)
+            # since we have already normalized the loss, we don't want to normalize
+            # by batch-size anymore
+            trainer.step(1)
+            ce_metric.update(0, [l * batch_size for l in cls_loss])
+
+            ori_ce_metric.update(0, [l * batch_size for l in ori_loss])
+
+            smoothl1_metric.update(0, [l * batch_size for l in box_loss])
+            name1, loss1 = ce_metric.get()
+            name3, loss3 = ori_ce_metric.get()
+            name2, loss2 = smoothl1_metric.get()
+            if i % 20 == 0:
+                print('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}={:.3f}, {}={:.3f}, {}={:.3f}'.format(
+                    epoch, i, batch_size / (time.time() - btic), name1, loss1, name3, loss3, name2, loss2))
+            btic = time.time()
+
+    #############################################################################################
+    # Save finetuned weights to disk
+    net.save_parameters('ssd_512_mobilenet1.0_pikachu.params')
