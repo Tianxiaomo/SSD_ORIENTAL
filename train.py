@@ -12,24 +12,22 @@
 import os
 import warnings
 import time
+import numpy as np
 import mxnet as mx
+from mxnet import nd
+from mxnet import gluon
 from mxnet import autograd
 from mxnet.gluon import nn
 from mxnet.gluon import HybridBlock
+from mxnet.gluon.loss import _reshape_like
+
+import gluoncv as gcv
+from gluoncv.loss import _as_list
+from gluoncv.data.batchify import Tuple, Stack
+from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
 from gluoncv.nn.feature import FeatureExpander
 from gluoncv.nn.predictor import ConvPredictor
 from gluoncv.nn.coder import MultiPerClassDecoder, NormalizedBoxCenterDecoder
-from mxnet import nd
-
-from gluoncv.data.batchify import Tuple, Stack, Pad
-from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
-from mxnet.gluon.loss import Loss, _apply_weighting, _reshape_like
-
-import numpy as np
-from mxnet import gluon
-import gluoncv as gcv
-from gluoncv.loss import _as_list
-
 
 class SSDAnchorGenerator(gluon.HybridBlock):
     """Bounding box anchor generator for Single-shot Object Detection.
@@ -517,13 +515,9 @@ def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
     base_name = None if callable(features) else name
     net = SSD_ORIENTAL(base_name, base_size, features, filters, sizes, ratios, steps,
               pretrained=pretrained_base, classes=classes, ctx=ctx, **kwargs)
-    # if pretrained:
-    #     from ..model_store import get_model_file
-    #     full_name = '_'.join(('ssd', str(base_size), name, dataset))
-    #     net.load_parameters(get_model_file(full_name, tag=pretrained, root=root), ctx=ctx)
     return net
 
-def ssd_512_mobilenet1_0_voc(pretrained=False, pretrained_base=True, **kwargs):
+def ssd_512_mobilenet1_0_voc(classes=('1','2','3'),pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with mobilenet1.0 base networks.
 
     Parameters
@@ -546,8 +540,7 @@ def ssd_512_mobilenet1_0_voc(pretrained=False, pretrained_base=True, **kwargs):
         A SSD detection network.
     """
     # classes = VOCDetection.CLASSES
-    classes = ('aeroplane',
-               'person', 'pottedplant',)
+    classes = classes
     return get_ssd('mobilenet1.0', 512,
                    features=['relu22_fwd', 'relu26_fwd'],
                    filters=[512, 512, 256, 256],
@@ -664,19 +657,37 @@ def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
         batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
     return train_loader
 
+
+def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
+    from gluoncv.data.batchify import Tuple, Stack, Pad
+    from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
+    width, height = data_shape, data_shape
+    # use fake data to generate fixed anchors for target generation
+    with autograd.train_mode():
+        _, _, anchors = net(mx.nd.zeros((1, 3, height, width)))
+    batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
+    train_loader = gluon.data.DataLoader(
+        train_dataset.transform(SSDDefaultTrainTransform(width, height, anchors)),
+        batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
+    return train_loader
+
+train_data = get_dataloader(net, dataset, 512, 16, 0)
+
 if __name__ == '__main__':
     net = ssd_512_mobilenet1_0_voc()
-    print(net)
+    # print(net)
     # mx.viz.plot_network(net).view()
     # net.render("net-test")
-    x = mx.sym.var('data')
-    asd = net(x)
+    # x = mx.sym.var('data')
+    # asd = net(x)
     # mx.viz.plot_network(asd[-1],node_attrs={"shape":"oval","fixedsize":"false"}).view()
 
     #############################################################################################
     # We can load dataset using ``RecordFileDetection``
-    dataset = gcv.data.RecordFileDetection('pikachu_train.rec')
-    classes = ['pikachu']  # only one foreground class here
+    dataset = gcv.data.RecordFileDetection('val.rec')
+    # classes = ['pikachu']  # only one foreground class here
+    classes = ['taxi','tax','quo','general','train','road','plane']
+    orientation = ['0','90','180','270']
     image, label = dataset[0]
 
     train_data = get_dataloader(net, dataset, 512, 16, 0)
