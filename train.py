@@ -11,6 +11,7 @@
 '''
 import os
 import warnings
+warnings.filterwarnings("ignore")
 import time
 import numpy as np
 import mxnet as mx
@@ -21,10 +22,20 @@ from mxnet.gluon import nn
 from mxnet.gluon import HybridBlock
 from mxnet.gluon.loss import _reshape_like
 
+from mxnet.gluon import Block
+from gluoncv.nn.matcher import CompositeMatcher, BipartiteMatcher, MaximumMatcher
+from gluoncv.nn.sampler import OHEMSampler, NaiveSampler
+from gluoncv.nn.coder import MultiClassEncoder, NormalizedBoxCenterEncoder
+from gluoncv.nn.bbox import BBoxCenterToCorner
+
 import gluoncv as gcv
 from gluoncv.loss import _as_list
+
+from gluoncv.data.transforms import bbox as tbbox
+from gluoncv.data.transforms import image as timage
+from gluoncv.data.transforms import experimental
+
 from gluoncv.data.batchify import Tuple, Stack
-from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
 from gluoncv.nn.feature import FeatureExpander
 from gluoncv.nn.predictor import ConvPredictor
 from gluoncv.nn.coder import MultiPerClassDecoder, NormalizedBoxCenterDecoder
@@ -638,6 +649,167 @@ class SSDOrientalMultiBoxLoss(gluon.Block):
 
         return sum_losses, cls_losses, ori_losses, box_losses
 
+
+class SSDTargetGenerator(Block):
+    """Training targets generator for Single-shot Object Detection.
+
+    Parameters
+    ----------
+    iou_thresh : float
+        IOU overlap threshold for maximum matching, default is 0.5.
+    neg_thresh : float
+        IOU overlap threshold for negative mining, default is 0.5.
+    negative_mining_ratio : float
+        Ratio of hard vs positive for negative mining.
+    stds : array-like of size 4, default is (0.1, 0.1, 0.2, 0.2)
+        Std value to be divided from encoded values.
+    """
+    def __init__(self, iou_thresh=0.5, neg_thresh=0.5, negative_mining_ratio=3,
+                 stds=(0.1, 0.1, 0.2, 0.2), **kwargs):
+        super(SSDTargetGenerator, self).__init__(**kwargs)
+        self._matcher = CompositeMatcher(
+            [BipartiteMatcher(share_max=False), MaximumMatcher(iou_thresh)])
+        if negative_mining_ratio > 0:
+            self._sampler = OHEMSampler(negative_mining_ratio, thresh=neg_thresh)
+            self._use_negative_sampling = True
+        else:
+            self._sampler = NaiveSampler()
+            self._use_negative_sampling = False
+        self._cls_encoder = MultiClassEncoder()
+        self._box_encoder = NormalizedBoxCenterEncoder(stds=stds)
+        self._center_to_corner = BBoxCenterToCorner(split=False)
+
+    # pylint: disable=arguments-differ
+    def forward(self, anchors, cls_preds, gt_boxes, gt_ids):
+        """Generate training targets."""
+        anchors = self._center_to_corner(anchors.reshape((-1, 4)))
+        ious = nd.transpose(nd.contrib.box_iou(anchors, gt_boxes), (1, 0, 2))
+        matches = self._matcher(ious)
+        if self._use_negative_sampling:
+            samples = self._sampler(matches, cls_preds, ious)
+        else:
+            samples = self._sampler(matches)
+        cls_targets = self._cls_encoder(samples, matches, gt_ids)
+        box_targets, box_masks = self._box_encoder(samples, matches, anchors, gt_boxes)
+        return cls_targets, box_targets, box_masks
+
+class SSDDefaultTrainTransform(object):
+    """Default SSD training transform which includes tons of image augmentations.
+
+    Parameters
+    ----------
+    width : int
+        Image width.
+    height : int
+        Image height.
+    anchors : mxnet.nd.NDArray, optional
+        Anchors generated from SSD networks, the shape must be ``(1, N, 4)``.
+        Since anchors are shared in the entire batch so it is ``1`` for the first dimension.
+        ``N`` is the number of anchors for each image.
+
+        .. hint::
+
+            If anchors is ``None``, the transformation will not generate training targets.
+            Otherwise it will generate training targets to accelerate the training phase
+            since we push some workload to CPU workers instead of GPUs.
+
+    mean : array-like of size 3
+        Mean pixel values to be subtracted from image tensor. Default is [0.485, 0.456, 0.406].
+    std : array-like of size 3
+        Standard deviation to be divided from image. Default is [0.229, 0.224, 0.225].
+    iou_thresh : float
+        IOU overlap threshold for maximum matching, default is 0.5.
+    box_norm : array-like of size 4, default is (0.1, 0.1, 0.2, 0.2)
+        Std value to be divided from encoded values.
+
+    """
+    def __init__(self, width, height, anchors=None, mean=(0.485, 0.456, 0.406),
+                 std=(0.229, 0.224, 0.225), iou_thresh=0.5, box_norm=(0.1, 0.1, 0.2, 0.2),
+                 **kwargs):
+        self._width = width
+        self._height = height
+        self._anchors = anchors
+        self._mean = mean
+        self._std = std
+        if anchors is None:
+            return
+
+        # since we do not have predictions yet, so we ignore sampling here
+        self._target_generator = SSDTargetGenerator(
+            iou_thresh=iou_thresh, stds=box_norm, negative_mining_ratio=-1, **kwargs)
+
+    def __call__(self, src, label):
+        """Apply transform to training image/label."""
+        # random color jittering
+        img = experimental.image.random_color_distort(src)
+
+        img, bbox = img,label
+        '''
+        # random expansion with prob 0.5
+        if np.random.uniform(0, 1) > 0.5:
+            img, expand = timage.random_expand(img, fill=[m * 255 for m in self._mean])
+            bbox = tbbox.translate(label, x_offset=expand[0], y_offset=expand[1])
+        else:
+            img, bbox = img, label
+
+        # random cropping
+        h, w, _ = img.shape
+        bbox, crop = experimental.bbox.random_crop_with_constraints(bbox, (w, h))
+        x0, y0, w, h = crop
+        img = mx.image.fixed_crop(img, x0, y0, w, h)
+
+        # resize with random interpolation
+        h, w, _ = img.shape
+        interp = np.random.randint(0, 5)
+        img = timage.imresize(img, self._width, self._height, interp=interp)
+        bbox = tbbox.resize(bbox, (w, h), (self._width, self._height))
+
+        # random horizontal flip
+        # h, w, _ = img.shape
+        # img, flips = timage.random_flip(img, px=0.5)
+        # bbox = tbbox.flip(bbox, (w, h), flip_x=flips[0])
+        '''
+        # rabdom rotation
+        h, w, _ = img.shape
+        clockwise_rotation_num = np.random.randint(0, 4)
+        if clockwise_rotation_num == 0:
+            pass
+        elif clockwise_rotation_num == 1:
+            ###顺时针90度
+            img = nd.transpose(img, [1, 0, 2])
+            img = img[:, ::-1, :]
+            bbox = np.array([h - bbox[:, 3], bbox[:, 0], h - bbox[:, 1], bbox[:, 2], bbox[:, 4], bbox[:, 5]]).T
+            bbox[:, 5] = (bbox[:, 5] + 1) % 4
+        elif clockwise_rotation_num == 2:
+            ##顺时针180度
+            img = img[::-1, ::-1, :]
+            bbox = np.array([w - bbox[:, 2], h - bbox[:, 3], w - bbox[:, 0], h - bbox[:, 1], bbox[:, 4], bbox[:, 5]]).T
+            bbox[:, 5] = (bbox[:, 5] + 2) % 4
+        else:
+            # 顺时针270度
+            img = nd.transpose(img, [1, 0, 2])
+            img = img[::-1, :, :]
+            bbox = np.array([bbox[:, 1], w - bbox[:, 2], bbox[:, 3], w - bbox[:, 0], bbox[:, 4], bbox[:, 5]]).T
+            bbox[:, 5] = (bbox[:, 5] + 3) % 4
+
+        # to tensor
+        img = mx.nd.image.to_tensor(img)
+        img = mx.nd.image.normalize(img, mean=self._mean, std=self._std)
+
+        if self._anchors is None:
+            return img, bbox.astype(img.dtype)
+
+        # generate training target so cpu workers can help reduce the workload on gpu
+        gt_bboxes = mx.nd.array(bbox[np.newaxis, :, :4])
+        gt_ids = mx.nd.array(bbox[np.newaxis, :, 4:5])
+        gt_ori = mx.nd.array(bbox[np.newaxis, :, 5:6])
+        cls_targets, box_targets, _ = self._target_generator(
+            self._anchors, None, gt_bboxes, gt_ids)
+        ori_targets, box_targets, _ = self._target_generator(
+            self._anchors, None, gt_bboxes, gt_ori)
+        return img, cls_targets[0], ori_targets[0], box_targets[0]
+
+
 #############################################################################################
 # Finetuning is a new round of training
 # --------------------------------------
@@ -650,31 +822,18 @@ def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
     width, height = data_shape, data_shape
     # use fake data to generate fixed anchors for target generation
     with autograd.train_mode():
-        _, _, anchors = net(mx.nd.zeros((1, 3, height, width)))
-    batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
+        _, _, _, anchors = net(mx.nd.zeros((1, 3, height, width)))
+    batchify_fn = Tuple(Stack(), Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
     train_loader = gluon.data.DataLoader(
         train_dataset.transform(SSDDefaultTrainTransform(width, height, anchors)),
         batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
     return train_loader
-
-
-def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
-    from gluoncv.data.batchify import Tuple, Stack, Pad
-    from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
-    width, height = data_shape, data_shape
-    # use fake data to generate fixed anchors for target generation
-    with autograd.train_mode():
-        _, _, anchors = net(mx.nd.zeros((1, 3, height, width)))
-    batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
-    train_loader = gluon.data.DataLoader(
-        train_dataset.transform(SSDDefaultTrainTransform(width, height, anchors)),
-        batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
-    return train_loader
-
-train_data = get_dataloader(net, dataset, 512, 16, 0)
 
 if __name__ == '__main__':
-    net = ssd_512_mobilenet1_0_voc()
+    classes = ['taxi','tax','quo','general','train','road','plane']
+    orientation = ['0','90','180','270']
+    net = ssd_512_mobilenet1_0_voc(classes=classes)
+    net.initialize()
     # print(net)
     # mx.viz.plot_network(net).view()
     # net.render("net-test")
@@ -685,9 +844,7 @@ if __name__ == '__main__':
     #############################################################################################
     # We can load dataset using ``RecordFileDetection``
     dataset = gcv.data.RecordFileDetection('val.rec')
-    # classes = ['pikachu']  # only one foreground class here
-    classes = ['taxi','tax','quo','general','train','road','plane']
-    orientation = ['0','90','180','270']
+
     image, label = dataset[0]
 
     train_data = get_dataloader(net, dataset, 512, 16, 0)
@@ -712,7 +869,7 @@ if __name__ == '__main__':
     ori_ce_metric = mx.metric.Loss('CrossEntropy')
     smoothl1_metric = mx.metric.Loss('SmoothL1')
 
-    for epoch in range(0, 2):
+    for epoch in range(0, 50):
         ce_metric.reset()
         ori_ce_metric.reset()
         smoothl1_metric.reset()
@@ -723,7 +880,8 @@ if __name__ == '__main__':
             batch_size = batch[0].shape[0]
             data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
             cls_targets = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
-            box_targets = gluon.utils.split_and_load(batch[2], ctx_list=ctx, batch_axis=0)
+            ori_targets = gluon.utils.split_and_load(batch[2], ctx_list=ctx, batch_axis=0)
+            box_targets = gluon.utils.split_and_load(batch[3], ctx_list=ctx, batch_axis=0)
             with autograd.record():
                 cls_preds = []
                 ori_preds = []
@@ -734,7 +892,7 @@ if __name__ == '__main__':
                     ori_preds.append(ori_pred)
                     box_preds.append(box_pred)
                 sum_loss, cls_loss, ori_loss, box_loss = mbox_loss(
-                    cls_preds,ori_preds , box_preds, cls_targets, box_targets)
+                    cls_preds,ori_preds , box_preds, cls_targets, ori_targets, box_targets)
                 autograd.backward(sum_loss)
             # since we have already normalized the loss, we don't want to normalize
             # by batch-size anymore
