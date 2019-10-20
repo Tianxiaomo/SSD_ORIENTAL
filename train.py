@@ -743,8 +743,8 @@ class SSDDefaultTrainTransform(object):
         # random color jittering
         img = experimental.image.random_color_distort(src)
 
-        img, bbox = img,label
-        '''
+        # img, bbox = img,label
+
         # random expansion with prob 0.5
         if np.random.uniform(0, 1) > 0.5:
             img, expand = timage.random_expand(img, fill=[m * 255 for m in self._mean])
@@ -768,7 +768,7 @@ class SSDDefaultTrainTransform(object):
         # h, w, _ = img.shape
         # img, flips = timage.random_flip(img, px=0.5)
         # bbox = tbbox.flip(bbox, (w, h), flip_x=flips[0])
-        '''
+
         # rabdom rotation
         h, w, _ = img.shape
         clockwise_rotation_num = np.random.randint(0, 4)
