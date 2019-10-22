@@ -84,8 +84,6 @@ def write_line(img_path, im_shape, boxes, ids, orientation, idx):
     line = '\t'.join(str_idx + str_header + str_labels + str_path) + '\n'
     return line
 
-
-
 def cv2_draw_box(img,box):
 #    box = [box[0],box[1],box[3],box[2]]
     if len(box)==4:
@@ -96,7 +94,6 @@ def cv2_draw_box(img,box):
     if len(box)==2:
         cv2.line(img,tuple(box[0]),tuple(box[1]),(0,0,255),10)
     return img
-   
 
 from glob import glob
 json_list = glob('./data/*.json')

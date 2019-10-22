@@ -290,6 +290,35 @@ class SSD_ORIENTAL(HybridBlock):
         self.nms_topk = nms_topk
         self.post_nms = post_nms
 
+    def cal_iou(self,F,box1, box1_area, boxes2, boxes2_area):
+        """
+        box1 [x1,y1,x2,y2]
+        boxes2 [Msample,x1,y1,x2,y2]
+        """
+        x1 = F.maximum(box1[0], boxes2[:, 0])
+        x2 = F.minimum(box1[2], boxes2[:, 2])
+        y1 = F.maximum(box1[1], boxes2[:, 1])
+        y2 = F.minimum(box1[3], boxes2[:, 3])
+
+        intersection = F.maximum(x2 - x1, 0) * F.maximum(y2 - y1, 0)
+        iou = intersection / (box1_area + boxes2_area[:] - intersection[:])
+        return iou
+
+    def cal_overlaps(self,F,boxes1, boxes2):
+        """
+        boxes1 [Nsample,x1,y1,x2,y2]  bbox_pre
+        boxes2 [Msample,x1,y1,x2,y2]  bbox_result
+        """
+        area1 = (boxes1[:, 0] - boxes1[:, 2]) * (boxes1[:, 1] - boxes1[:, 3])
+        area2 = (boxes2[:, 0] - boxes2[:, 2]) * (boxes2[:, 1] - boxes2[:, 3])
+
+        overlaps = F.zeros((boxes1.shape[0], boxes2.shape[0]))
+
+        for i in range(boxes2.shape[0]):
+            overlaps[:, i] = self.cal_iou(F,boxes2[i], area2[i], boxes1, area1)
+
+        return overlaps
+
     # pylint: disable=arguments-differ
     def hybrid_forward(self, F, x):
         """Hybrid forward"""
@@ -326,15 +355,15 @@ class SSD_ORIENTAL(HybridBlock):
             results.append(per_result)
         result = F.concat(*results, dim=1)
 
-        results_ori = []
-        for i in range(self.num_oriental):
-            ori_id = ori_ids.slice_axis(axis=-1, begin=i, end=i+1)
-            score_ori = scores_ori.slice_axis(axis=-1, begin=i, end=i + 1)
-            # per ori results
-            per_result = F.concat(*[ori_id, score_ori, bboxes], dim=-1)
-            results_ori.append(per_result)
-
-        result_ori = F.concat(*results_ori, dim=1)
+        # results_ori = []
+        # for i in range(self.num_oriental):
+        #     ori_id = ori_ids.slice_axis(axis=-1, begin=i, end=i+1)
+        #     score_ori = scores_ori.slice_axis(axis=-1, begin=i, end=i + 1)
+        #     # per ori results
+        #     per_result = F.concat(*[ori_id, score_ori, bboxes], dim=-1)
+        #     results_ori.append(per_result)
+        #
+        # result_ori = F.concat(*results_ori, dim=1)
 
         if self.nms_thresh > 0 and self.nms_thresh < 1:
             result = F.contrib.box_nms(
@@ -344,8 +373,12 @@ class SSD_ORIENTAL(HybridBlock):
                 result = result.slice_axis(axis=1, begin=0, end=self.post_nms)
         ids = F.slice_axis(result, axis=2, begin=0, end=1)
         scores = F.slice_axis(result, axis=2, begin=1, end=2)
-        bboxes = F.slice_axis(result, axis=2, begin=2, end=6)
-        return ids, scores, bboxes,result_ori
+        res_bboxes = F.slice_axis(result, axis=2, begin=2, end=6)
+
+        iou = self.cal_overlaps(F,bboxes[0], res_bboxes[0])
+        bbox_id = iou.argmax(axis=0)
+        result_ori = scores_ori[:,bbox_id].argmax(axis=-1).expand_dims(axis=-1)
+        return ids, scores, res_bboxes,result_ori
 
     def reset_class(self, classes, reuse_weights=None):
         """Reset class categories and class predictors.
