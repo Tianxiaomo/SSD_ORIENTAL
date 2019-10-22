@@ -12,7 +12,8 @@
 import os
 import warnings
 warnings.filterwarnings("ignore")
-import time
+import time,datetime,logging,sys
+from tqdm import tqdm
 import numpy as np
 import mxnet as mx
 from mxnet import nd
@@ -39,6 +40,50 @@ from gluoncv.data.batchify import Tuple, Stack
 from gluoncv.nn.feature import FeatureExpander
 from gluoncv.nn.predictor import ConvPredictor
 from gluoncv.nn.coder import MultiPerClassDecoder, NormalizedBoxCenterDecoder
+
+
+def save_checkpoint(net,log,loss,epoch,checkpoints_dir='checkpoints',ext='params'):
+    if not os.path.exists(checkpoints_dir):
+        os.mkdir(checkpoints_dir)
+    check_path = os.path.join(checkpoints_dir,
+                              f'ssd_epoch{epoch:03d}_'
+                              f'{loss:.4f}.{ext}')
+    net.save_parameters(check_path)
+    log.info('saving to {}'.format(check_path))
+
+def get_date_str():
+    now = datetime.datetime.now()
+    return now.strftime('%Y-%m-%d_%H-%M-%S')
+
+def init_logger(log_file=None, log_path=None, log_level=logging.DEBUG, mode='w', stdout=True):
+    """
+    log_path: 日志文件的文件夹路径
+    mode: 'a', append; 'w', 覆盖原文件写入.
+    """
+    fmt = '%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
+    if log_path is None:
+        log_path = '~/temp/log/'
+    if log_file is None:
+        log_file = 'log_' + get_date_str() + '.log'
+    log_file = os.path.join(log_path, log_file)
+    # 此处不能使用logging输出
+    print('log file path:' + log_file)
+    if not os.path.exists(log_path):
+        os.mkdir(log_path)
+    logging.basicConfig(level=log_level,
+                        format=fmt,
+                        filename=os.path.abspath(log_file),
+                        filemode=mode)
+
+    if stdout:
+        console = logging.StreamHandler(stream=sys.stdout)
+        console.setLevel(logging.INFO)
+        formatter = logging.Formatter(fmt)
+        console.setFormatter(formatter)
+        logging.getLogger('').addHandler(console)
+
+    return logging
+
 
 class SSDAnchorGenerator(gluon.HybridBlock):
     """Bounding box anchor generator for Single-shot Object Detection.
@@ -682,7 +727,6 @@ class SSDOrientalMultiBoxLoss(gluon.Block):
 
         return sum_losses, cls_losses, ori_losses, box_losses
 
-
 class SSDTargetGenerator(Block):
     """Training targets generator for Single-shot Object Detection.
 
@@ -842,14 +886,6 @@ class SSDDefaultTrainTransform(object):
             self._anchors, None, gt_bboxes, gt_ori)
         return img, cls_targets[0], ori_targets[0], box_targets[0]
 
-
-#############################################################################################
-# Finetuning is a new round of training
-# --------------------------------------
-# .. hint::
-#
-#     You will find a more detailed training implementation of SSD here:
-#     :download:`Download train_ssd.py<../../../scripts/detection/ssd/train_ssd.py>`
 def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
 
     width, height = data_shape, data_shape
@@ -863,24 +899,27 @@ def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
     return train_loader
 
 if __name__ == '__main__':
+
+    pre_weights = None
+    gpus = 0
+    lr = 0.001
+    wd = 0.0005
+    momentum = 0.9
+    batch = 16
+    epochs = 200
+
+    log = init_logger(log_path='logs')
+    log.info('optimizer {},batch{},lr {},pretrained {},gpu:{}'.format('sgd', batch,lr, pre_weights, gpus))
+
     classes = ['taxi','tax','quo','general','train','road','plane']
     orientation = ['0','90','180','270']
     net = ssd_512_mobilenet1_0_voc(classes=classes)
     net.initialize()
-    # print(net)
-    # mx.viz.plot_network(net).view()
-    # net.render("net-test")
-    # x = mx.sym.var('data')
-    # asd = net(x)
-    # mx.viz.plot_network(asd[-1],node_attrs={"shape":"oval","fixedsize":"false"}).view()
 
     #############################################################################################
     # We can load dataset using ``RecordFileDetection``
     dataset = gcv.data.RecordFileDetection('val.rec')
-
-    image, label = dataset[0]
-
-    train_data = get_dataloader(net, dataset, 512, 16, 0)
+    train_data = get_dataloader(net, dataset, 512, batch, 0)
 
     #############################################################################################
     # Try use GPU for training
@@ -895,54 +934,63 @@ if __name__ == '__main__':
     net.collect_params().reset_ctx(ctx)
     trainer = gluon.Trainer(
         net.collect_params(), 'sgd',
-        {'learning_rate': 0.001, 'wd': 0.0005, 'momentum': 0.9})
+        {'learning_rate': lr, 'wd': wd, 'momentum': 0.9})
 
     mbox_loss = SSDOrientalMultiBoxLoss()
     ce_metric = mx.metric.Loss('CrossEntropy')
     ori_ce_metric = mx.metric.Loss('CrossEntropy')
     smoothl1_metric = mx.metric.Loss('SmoothL1')
 
-    for epoch in range(0, 50):
+    best_loss = 1e6
+    for epoch in range(0, epochs):
+        log.info(f'Epoch {epoch}/{epochs}')
+
         ce_metric.reset()
         ori_ce_metric.reset()
         smoothl1_metric.reset()
         tic = time.time()
         btic = time.time()
         net.hybridize(static_alloc=True, static_shape=True)
-        for i, batch in enumerate(train_data):
-            batch_size = batch[0].shape[0]
-            data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
-            cls_targets = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
-            ori_targets = gluon.utils.split_and_load(batch[2], ctx_list=ctx, batch_axis=0)
-            box_targets = gluon.utils.split_and_load(batch[3], ctx_list=ctx, batch_axis=0)
-            with autograd.record():
-                cls_preds = []
-                ori_preds = []
-                box_preds = []
-                for x in data:
-                    cls_pred, ori_pred, box_pred, _ = net(x)
-                    cls_preds.append(cls_pred)
-                    ori_preds.append(ori_pred)
-                    box_preds.append(box_pred)
-                sum_loss, cls_loss, ori_loss, box_loss = mbox_loss(
-                    cls_preds,ori_preds , box_preds, cls_targets, ori_targets, box_targets)
-                autograd.backward(sum_loss)
-            # since we have already normalized the loss, we don't want to normalize
-            # by batch-size anymore
-            trainer.step(1)
-            ce_metric.update(0, [l * batch_size for l in cls_loss])
+        with tqdm(total=len(train_data), desc='Train Epoch:{}'.format(epoch)) as pbar:
+            for i, batch in enumerate(train_data):
+                batch_size = batch[0].shape[0]
+                data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
+                cls_targets = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
+                ori_targets = gluon.utils.split_and_load(batch[2], ctx_list=ctx, batch_axis=0)
+                box_targets = gluon.utils.split_and_load(batch[3], ctx_list=ctx, batch_axis=0)
+                with autograd.record():
+                    cls_preds = []
+                    ori_preds = []
+                    box_preds = []
+                    for x in data:
+                        cls_pred, ori_pred, box_pred, _ = net(x)
+                        cls_preds.append(cls_pred)
+                        ori_preds.append(ori_pred)
+                        box_preds.append(box_pred)
+                    sum_loss, cls_loss, ori_loss, box_loss = mbox_loss(
+                        cls_preds,ori_preds , box_preds, cls_targets, ori_targets, box_targets)
+                    autograd.backward(sum_loss)
+                # since we have already normalized the loss, we don't want to normalize
+                # by batch-size anymore
+                trainer.step(1)
+                ce_metric.update(0, [l * batch_size for l in cls_loss])
+                ori_ce_metric.update(0, [l * batch_size for l in ori_loss])
+                smoothl1_metric.update(0, [l * batch_size for l in box_loss])
+                name1, loss1 = ce_metric.get()
+                name3, loss3 = ori_ce_metric.get()
+                name2, loss2 = smoothl1_metric.get()
 
-            ori_ce_metric.update(0, [l * batch_size for l in ori_loss])
+                pbar.set_postfix(
+                    {'loss': '{0:1.5f}'.format(loss1 + loss2 + loss3), 'loss_ce': '{0:1.4f}'.format(loss1),
+                     'loss_ori': '{0:1.4f}'.format(loss2),'loss_box':'{0:1.4f}'.format(loss3)})  # 输入一个字典，显示实验指标
+                pbar.update(1)
 
-            smoothl1_metric.update(0, [l * batch_size for l in box_loss])
-            name1, loss1 = ce_metric.get()
-            name3, loss3 = ori_ce_metric.get()
-            name2, loss2 = smoothl1_metric.get()
-            if i % 20 == 0:
-                print('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}={:.3f}, {}={:.3f}, {}={:.3f}'.format(
-                    epoch, i, batch_size / (time.time() - btic), name1, loss1, name3, loss3, name2, loss2))
-            btic = time.time()
+                if i % 20 == 0:
+                    log.debug('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}={:.3f}, {}={:.3f}, {}={:.3f}'.format(
+                        epoch, i, batch_size / (time.time() - btic), name1, loss1, name3, loss3, name2, loss2))
+                btic = time.time()
 
-    #############################################################################################
-    # Save finetuned weights to disk
-    net.save_parameters('ssd_512_mobilenet1.0_pikachu.params')
+        loss = loss1 + loss2 + loss3
+        if loss < best_loss:
+            best_loss = loss
+            save_checkpoint(net,log,loss,epoch)
