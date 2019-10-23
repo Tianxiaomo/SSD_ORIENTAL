@@ -901,11 +901,11 @@ def get_dataloader(net, train_dataset, data_shape, batch_size, num_workers):
 if __name__ == '__main__':
 
     pre_weights = None
-    gpus = 0
+    gpus = [0,1,2,3,4]
     lr = 0.001
     wd = 0.0005
     momentum = 0.9
-    batch = 16
+    batch = 2
     epochs = 200
 
     log = init_logger(log_path='logs')
@@ -914,18 +914,23 @@ if __name__ == '__main__':
     classes = ['taxi','tax','quo','general','train','road','plane']
     orientation = ['0','90','180','270']
     net = ssd_512_mobilenet1_0_voc(classes=classes)
-    net.initialize()
+
+    if pre_weights == None:
+        net.initialize()
+    else:
+        net.load_parameters(pre_weights)
 
     #############################################################################################
     # We can load dataset using ``RecordFileDetection``
-    dataset = gcv.data.RecordFileDetection('val.rec')
+    dataset = gcv.data.RecordFileDetection('data/val.rec')
     train_data = get_dataloader(net, dataset, 512, batch, 0)
 
     #############################################################################################
     # Try use GPU for training
     try:
         a = mx.nd.zeros((1,), ctx=mx.gpu(0))
-        ctx = [mx.gpu(0)]
+        ctx = [mx.gpu(i) for i in gpus]
+        # ctx = [mx.gpu(0)]
     except:
         ctx = [mx.cpu()]
 
@@ -941,7 +946,7 @@ if __name__ == '__main__':
     ori_ce_metric = mx.metric.Loss('CrossEntropy')
     smoothl1_metric = mx.metric.Loss('SmoothL1')
 
-    best_loss = 1e6
+    loss = best_loss = 1e6
     for epoch in range(0, epochs):
         log.info(f'Epoch {epoch}/{epochs}')
 
@@ -990,7 +995,7 @@ if __name__ == '__main__':
                         epoch, i, batch_size / (time.time() - btic), name1, loss1, name3, loss3, name2, loss2))
                 btic = time.time()
 
-        loss = loss1 + loss2 + loss3
+                loss = loss1 + loss2 + loss3
         if loss < best_loss:
             best_loss = loss
             save_checkpoint(net,log,loss,epoch)

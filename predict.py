@@ -585,12 +585,18 @@ def ssd_512_mobilenet1_0_voc(classes=('1','2','3'),pretrained=False, pretrained_
 
 if __name__ == '__main__':
     classes = ['taxi','tax','quo','general','train','road','plane']
-    orientation = ['0','90','180','270']
+    # orientation = ['0','90','180','270']
+    orientation = ['down','left','up','right']
     net = ssd_512_mobilenet1_0_voc(classes=classes)
     net.load_parameters('ssd_512_mobilenet1.0_pikachu.params')
 
-    x, image = gcv.data.transforms.presets.ssd.load_test('./20190722135231_ori.jpg', 512)
+    # x, image = gcv.data.transforms.presets.ssd.load_test('./20190722135231_ori.jpg', 512)
+    x, image = gcv.data.transforms.presets.ssd.load_test('./201907121159292.jpg', 512)
+    # x, image = gcv.data.transforms.presets.ssd.load_test('./test.jpg', 512)
+
     cid, score, bbox,orien = net(x)
-    ax = viz.plot_bbox(image, bbox[0], score[0], cid[0], class_names=classes,thresh=0.45)
+    ax = viz.plot_bbox(image, bbox[0], score[0], cid[0], class_names=classes,thresh=0.3)
+    ax = viz.plot_bbox(image, bbox[0], score[0], orien[0], class_names=orientation,thresh=0.3)
     plt.show()
     print(orien[0,:4,0])
+    print(cid[0,:4,0])
